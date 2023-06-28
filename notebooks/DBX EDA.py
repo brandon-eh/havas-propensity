@@ -730,6 +730,10 @@ encoding_flagged_question_metadata_df.display()
 
 # COMMAND ----------
 
+encoding_flagged_question_metadata_df.select("name").distinct().orderBy("name").display()
+
+# COMMAND ----------
+
 # MAGIC %md ## 3.5 Correlation Matrix
 # MAGIC - All columns have relatively low correlation with s_current other than consideration
 # MAGIC - Checked correlation for consideration but also low so will stick with s_current
