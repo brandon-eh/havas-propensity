@@ -11,7 +11,7 @@
 
 # COMMAND ----------
 
-# MAGIC %pip install google-cloud-storage gcsfs imblearn
+# MAGIC %pip install google-cloud-storage gcsfs imblearn -U scikit-learn
 
 # COMMAND ----------
 
@@ -34,10 +34,12 @@ from sklearn.impute import KNNImputer, SimpleImputer
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.model_selection import train_test_split, GridSearchCV
 from sklearn.compose import make_column_transformer
-from sklearn.metrics import f1_score, confusion_matrix
+from sklearn.metrics import f1_score, confusion_matrix, classification_report
 from sklearn.pipeline import make_pipeline, Pipeline
+from sklearn.ensemble import RandomForestClassifier
 
 from imblearn.under_sampling import RandomUnderSampler
+from imblearn.pipeline import Pipeline as Pipeline_imb
 
 from xgboost import XGBClassifier
 
@@ -728,7 +730,7 @@ encoding_flagged_question_metadata_df.display()
 
 # COMMAND ----------
 
-# MAGIC %md ## 3.5 Analyse Correlation
+# MAGIC %md ## 3.5 Correlation Matrix
 # MAGIC - All columns have relatively low correlation with s_current other than consideration
 # MAGIC - Checked correlation for consideration but also low so will stick with s_current
 
@@ -830,7 +832,7 @@ for col_name in nominal_cols:
             .withColumn("perc_rows", col("cnt")/F.sum("cnt").over(empty_window))
         )
 
-        grouped_df = grouped_df.filter(col("perc_rows") < 0.01)
+        grouped_df = grouped_df.filter(col("perc_rows") < 0.1) #< 0.01)
         col_values_to_group = [i[col_name] for i in grouped_df.collect()]
 
         group_col_dict[col_name] = col_values_to_group
@@ -853,6 +855,64 @@ for col_name, value_list in group_col_dict.items():
 
 # COMMAND ----------
 
+# MAGIC %md ## 3.7 Random Forest Feature Importance
+
+# COMMAND ----------
+
+
+# random forest for feature importance on a classification problem
+from sklearn.datasets import make_classification
+
+from matplotlib import pyplot
+# define dataset
+X, y = make_classification(n_samples=1000, n_features=10, n_informative=5, n_redundant=5, random_state=1)
+# define the model
+model = RandomForestClassifier()
+# fit the model
+model.fit(X, y)
+# get importance
+importance = model.feature_importances_
+# summarize feature importance
+for i,v in enumerate(importance):
+ print('Feature: %0d, Score: %.5f' % (i,v))
+# plot feature importance
+pyplot.bar([x for x in range(len(importance))], importance)
+pyplot.show()
+
+# COMMAND ----------
+
+# Undersample, fill, impute, encode
+
+# Defining the encoding variables
+ordinal_columns = [i["new_alias"] for i in encoding_flagged_question_metadata_df.filter(col("encoding_flag") == "ordinal").select("new_alias").collect() if i["new_alias"] in list(x_train.columns)]
+nominal_columns = [i["new_alias"] for i in encoding_flagged_question_metadata_df.filter(col("encoding_flag") == "nominal").select("new_alias").collect() if i["new_alias"] in list(x_train.columns)]
+nominal_columns.append(["s_consideration", "rl_consideration", "rl_current"])
+all_columns = [i["new_alias"] for i in encoding_flagged_question_metadata_df.select("new_alias").collect() if i["new_alias"] in list(x_train.columns)]
+
+# Calling the encoder classes
+fill_imputer = SimpleImputer(strategy="constant", fill_value=0)
+knn_imputer = KNNImputer()
+oh_encoder = OneHotEncoder(drop="if_binary", handle_unknown="infrequent_if_exist")
+
+# Make column transformer
+column_transform = make_column_transformer(
+    # (fill_imputer, nominal_columns),
+    # (knn_imputer, ordinal_columns),
+    (oh_encoder, all_columns),
+    remainder="passthrough"
+    )
+
+# Make undersampler
+undersampler = RandomUnderSampler()
+
+# Make classifier
+xgb_classifier = XGBClassifier(objective="binary:logistic")
+
+# Make pipeline
+pipeline = Pipeline([("transformers", column_transform), ("xgb_classifier", xgb_classifier)])
+
+# COMMAND ----------
+
 # MAGIC %md # 4. Create model
 
 # COMMAND ----------
@@ -862,12 +922,19 @@ for col_name, value_list in group_col_dict.items():
 # COMMAND ----------
 
 # Drop unnecessary columns
-
 input_df = (
     grouped_counts_df
     .withColumn("target", col("s_current"))
     .drop("s_id", "d_id", "r_id", "p_id", "weights", "s_current")
 )
+
+# COMMAND ----------
+
+# input_df.write.option('compression','snappy').mode('overwrite').parquet("s3a://prd-matchesfashion-datalake-scratch/ds-customer/brandon/hm_prop_input_df")
+input_df = spark.read.parquet("s3a://prd-matchesfashion-datalake-scratch/ds-customer/brandon/hm_prop_input_df")
+# # df_.write.option('compression','snappy').mode('overwrite').parquet('s3://path/to/file.parquet')
+
+# COMMAND ----------
 
 # Split and check counts
 train_df, test_df = input_df.randomSplit(weights=[0.7, 0.3], seed=42)
@@ -884,10 +951,13 @@ y_train = train_df_pd["target"]
 x_test = test_df_pd.drop("target", axis = 1)
 y_test = test_df_pd["target"]
 
+# COMMAND ----------
+
+# input_df.display()
 
 # COMMAND ----------
 
-# MAGIC %md ## 4.1 Set up pipeline
+# MAGIC %md ## 4.2 Set up pipeline
 # MAGIC - Will undersample to balance classes
 # MAGIC - Impute for ordinal, fill for nominal
 # MAGIC - Will use KNN imputer as other survey answers are correlated
@@ -897,24 +967,33 @@ y_test = test_df_pd["target"]
 # Undersample, fill, impute, encode
 
 # Defining the encoding variables
-ordinal_columns = [i["new_alias"] for i in encoding_flagged_question_metadata_df.filter(col("encoding_flag") == "ordinal").select("new_alias").collect() if i["new_alias"] in list(x_train.columns)]
-nominal_columns = [i["new_alias"] for i in encoding_flagged_question_metadata_df.filter(col("encoding_flag") == "nominal").select("new_alias").collect() if i["new_alias"] in list(x_train.columns)]
+ordinal_columns = [i["new_alias"] for i in encoding_flagged_question_metadata_df.filter(col("encoding_flag") == "ordinal").select("new_alias").distinct().collect() if i["new_alias"] in list(x_train.columns)]
+nominal_columns = [i["new_alias"] for i in encoding_flagged_question_metadata_df.filter(col("encoding_flag") == "nominal").select("new_alias").distinct().collect() if i["new_alias"] in list(x_train.columns)]
 nominal_columns.append(["s_consideration", "rl_consideration", "rl_current"])
-all_columns = [i["new_alias"] for i in encoding_flagged_question_metadata_df.select("new_alias").collect() if i["new_alias"] in list(x_train.columns)]
+all_columns = [i["new_alias"] for i in encoding_flagged_question_metadata_df.select("new_alias").distinct().collect() if i["new_alias"] in list(x_train.columns)]
 
-# Calling the encoder classes
-fill_imputer = SimpleImputer(strategy="constant", fill_value=0)
+ordinal_columns
+
+# Fill nominal nulls with 0
+x_train[nominal_columns] = x_train[nominal_columns].fillna(0)
+x_test[nominal_columns] = x_test[nominal_columns].fillna(0)
+
+# # Calling the encoder classes
+# fill_imputer = SimpleImputer(missing_values=np.nan, strategy="constant", fill_value=0)
+# fill_pipeline = Pipeline(["fill_imputer", fill_imputer])
+
 knn_imputer = KNNImputer()
-oh_encoder = OneHotEncoder(drop="if_binary")
+oh_encoder = OneHotEncoder(drop="if_binary", handle_unknown="infrequent_if_exist")
 
 # Make column transformer
 column_transform = make_column_transformer(
-    (fill_imputer, nominal_columns),
+    # (fill_imputer, nominal_columns),
+    # (fill_pipeline, nominal_columns),
     (knn_imputer, ordinal_columns),
     (oh_encoder, all_columns),
     remainder="passthrough"
-    )
-                                        
+)
+
 # Make undersampler
 undersampler = RandomUnderSampler()
 
@@ -922,7 +1001,9 @@ undersampler = RandomUnderSampler()
 xgb_classifier = XGBClassifier(objective="binary:logistic")
 
 # Make pipeline
-pipeline = Pipeline([("transformers", column_transform), ("xgb_classifier", xgb_classifier)])
+# pipeline = Pipeline([("undersampler", undersampler), ("transformers", column_transform), ("xgb_classifier", xgb_classifier)])
+
+pipeline = Pipeline_imb([("transformers", column_transform), ("undersampler", undersampler), ("xgb_classifier", xgb_classifier)])
 
 # COMMAND ----------
 
@@ -957,21 +1038,47 @@ predict_proba = pipeline.predict_proba(x_test)
 output_df_pd = test_df_pd.copy(deep=True)
 
 output_df_pd["y_pred"] = y_pred
-output_df_pd["predict_proba"] = predict_proba
+# output_df_pd["predict_proba"] = predict_proba
 
 # COMMAND ----------
 
-# Plot Confusion Matrix
+predict_proba
+# xgb_classifier.classes_
 
+# COMMAND ----------
+
+# cm
+y_pred.sum()
+
+# COMMAND ----------
+
+# Get classification report
+print(classification_report(y_test, y_pred))
+
+# Plot Confusion Matrix
 cm = confusion_matrix(y_test, y_pred)
 fig = px.imshow(cm, text_auto=True)
 # fig['layout'].update(height = 1500, width = 1500)
+fig.update_layout(xaxis_title="True", yaxis_title="Pred")
 fig.show()
 
 
 # COMMAND ----------
 
 # MAGIC %md # 6. Profiling
+
+# COMMAND ----------
+
+# xgb_classifier.feature_importances_
+
+# x_train_transformed = pipeline[:-2].transform(x_train)
+
+# Access column names after transformation
+# oh_encoder.feature_names_in_ndarray
+# oh_encoder.get_feature_names_out()
+list(column_transform.transformers_[0][1].get_feature_names_out())
+
+# df = pd.DataFrame.sparse.from_spmatrix(x_train_transformed, columns=['A', 'B', 'C'])
 
 # COMMAND ----------
 
